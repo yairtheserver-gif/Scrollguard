@@ -1,0 +1,279 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Write project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_SG'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.example.scrollguard"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.example.scrollguard"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
+          }
+          EOF_SG
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_SG'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+              <application android:label="@string/app_name" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".PushupActivity" android:exported="false"
+                      android:launchMode="singleTask" android:excludeFromRecents="true" />
+                  <service android:name=".ScrollGuardService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_SG
+          mkdir -p app/src/main/kotlin/com/example/scrollguard
+          cat > app/src/main/kotlin/com/example/scrollguard/MainActivity.kt <<'EOF_SG'
+          package com.example.scrollguard
+
+          import android.Manifest
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(48, 48, 48, 48) }
+                  root.addView(TextView(this).apply { text = "ScrollGuard\n\n1. Allow camera\n2. Enable the ScrollGuard accessibility service"; textSize = 18f })
+                  root.addView(Button(this).apply {
+                      text = "1. Allow camera"
+                      setOnClickListener { requestPermissions(arrayOf(Manifest.permission.CAMERA), 1) }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "2. Open accessibility settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(root)
+              }
+          }
+          EOF_SG
+          mkdir -p app/src/main/kotlin/com/example/scrollguard
+          cat > app/src/main/kotlin/com/example/scrollguard/PushupActivity.kt <<'EOF_SG'
+          package com.example.scrollguard
+
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.activity.OnBackPressedCallback
+          import androidx.camera.core.CameraSelector
+          import androidx.camera.core.ImageAnalysis
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.pose.Pose
+          import com.google.mlkit.vision.pose.PoseDetection
+          import com.google.mlkit.vision.pose.PoseLandmark
+          import com.google.mlkit.vision.pose.defaults.PoseDetectorOptions
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+          import kotlin.math.atan2
+
+          @androidx.camera.core.ExperimentalGetImage
+          class PushupActivity : ComponentActivity() {
+              private lateinit var label: TextView
+              private var count = 0
+              private var down = false
+              private val executor = Executors.newSingleThreadExecutor()
+              private val detector = PoseDetection.getClient(
+                  PoseDetectorOptions.Builder().setDetectorMode(PoseDetectorOptions.STREAM_MODE).build()
+              )
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  label = TextView(this).apply {
+                      textSize = 28f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); setBackgroundColor(Color.BLACK)
+                  }
+                  setContentView(label)
+                  render()
+                  // No escaping with Back (Home still works, but the service re-locks you on next scroll)
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) { override fun handleOnBackPressed() {} })
+                  startCamera()
+              }
+
+              private fun startCamera() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      val analysis = ImageAnalysis.Builder()
+                          .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+                      analysis.setAnalyzer(executor) { proxy ->
+                          val img = proxy.image
+                          if (img == null) { proxy.close(); return@setAnalyzer }
+                          detector.process(InputImage.fromMediaImage(img, proxy.imageInfo.rotationDegrees))
+                              .addOnSuccessListener { onPose(it) }
+                              .addOnCompleteListener { proxy.close() }
+                      }
+                      future.get().bindToLifecycle(this, CameraSelector.DEFAULT_FRONT_CAMERA, analysis)
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              private fun onPose(pose: Pose) {
+                  val sides = listOf(
+                      Triple(PoseLandmark.LEFT_SHOULDER, PoseLandmark.LEFT_ELBOW, PoseLandmark.LEFT_WRIST),
+                      Triple(PoseLandmark.RIGHT_SHOULDER, PoseLandmark.RIGHT_ELBOW, PoseLandmark.RIGHT_WRIST)
+                  ).mapNotNull { (s, e, w) ->
+                      val a = pose.getPoseLandmark(s); val b = pose.getPoseLandmark(e); val c = pose.getPoseLandmark(w)
+                      if (a != null && b != null && c != null) Pair(b.inFrameLikelihood, angle(a, b, c)) else null
+                  }
+                  val elbow = sides.maxByOrNull { it.first }?.second ?: return
+                  if (elbow < 90 && !down) down = true
+                  else if (elbow > 160 && down) {
+                      down = false; count++; render()
+                      if (count >= ScrollGuardService.pending) {
+                          ScrollGuardService.pending = 0
+                          finish()
+                      }
+                  }
+              }
+
+              private fun angle(a: PoseLandmark, b: PoseLandmark, c: PoseLandmark): Double {
+                  val r = atan2((c.position.y - b.position.y).toDouble(), (c.position.x - b.position.x).toDouble()) -
+                          atan2((a.position.y - b.position.y).toDouble(), (a.position.x - b.position.x).toDouble())
+                  var d = abs(Math.toDegrees(r)); if (d > 180) d = 360 - d
+                  return d
+              }
+
+              private fun render() {
+                  label.text = "You scrolled ${ScrollGuardService.pending} videos.\n\nPush-ups: $count / ${ScrollGuardService.pending}\n\nPlace phone on the floor,\nfront camera facing you."
+              }
+
+              override fun onStop() { super.onStop(); ScrollGuardService.showing = false }
+              override fun onDestroy() { super.onDestroy(); detector.close(); executor.shutdown() }
+          }
+          EOF_SG
+          mkdir -p app/src/main/kotlin/com/example/scrollguard
+          cat > app/src/main/kotlin/com/example/scrollguard/ScrollGuardService.kt <<'EOF_SG'
+          package com.example.scrollguard
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import kotlin.random.Random
+
+          class ScrollGuardService : AccessibilityService() {
+              companion object {
+                  @Volatile var pending = 0      // push-ups still owed (0 = not locked)
+                  @Volatile var showing = false  // lock screen currently visible
+                  const val MIN_MINUTES = 5L     // <-- lock interval range, edit here
+                  const val MAX_MINUTES = 15L
+              }
+
+              private var scrolled = 0
+              private var lastScroll = 0L
+              private var lastSeen = 0L
+              private var deadline = 0L
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val now = SystemClock.elapsedRealtime()
+                  if (pending > 0) { lock(); return }  // still owe push-ups: block again
+
+                  // New session if we haven't seen a social app for 2 min
+                  if (deadline == 0L || now - lastSeen > 120_000) {
+                      deadline = now + Random.nextLong(MIN_MINUTES, MAX_MINUTES + 1) * 60_000
+                      scrolled = 0
+                  }
+                  lastSeen = now
+
+                  // Each swipe (debounced) ~= one video
+                  if (e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastScroll > 800) {
+                      scrolled++; lastScroll = now
+                  }
+                  if (now >= deadline) {
+                      pending = maxOf(scrolled, 1)
+                      deadline = 0; scrolled = 0
+                      lock()
+                  }
+              }
+
+              private fun lock() {
+                  if (showing) return
+                  showing = true
+                  startActivity(Intent(this, PushupActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              }
+
+              override fun onInterrupt() {}
+          }
+          EOF_SG
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_SG'
+          <resources>
+              <string name="app_name">ScrollGuard</string>
+              <string name="service_desc">Counts videos you scroll in social apps and locks them until you do push-ups.</string>
+          </resources>
+          EOF_SG
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_SG'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/service_desc"
+              android:accessibilityEventTypes="typeViewScrolled|typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="100"
+              android:canRetrieveWindowContent="false"
+              android:packageNames="com.google.android.youtube,com.instagram.android,com.facebook.katana,com.zhiliaoapp.musically,com.snapchat.android,com.twitter.android,com.reddit.frontpage" />
+          EOF_SG
+          cat > build.gradle.kts <<'EOF_SG'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_SG
+          cat > gradle.properties <<'EOF_SG'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_SG
+          cat > settings.gradle.kts <<'EOF_SG'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ScrollGuard"
+          include(":app")
+          EOF_SG
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScrollGuard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
