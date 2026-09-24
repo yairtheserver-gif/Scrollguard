@@ -111,6 +111,7 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.atan2
 
+          @androidx.camera.core.ExperimentalGetImage
           class PushupActivity : ComponentActivity() {
               private lateinit var label: TextView
               private var count = 0
@@ -189,6 +190,93 @@ jobs:
           import android.accessibilityservice.AccessibilityService
           import android.content.Intent
           import android.os.SystemClock
+          import android.view.accessibility.AccessibilityEvent
+          import kotlin.random.Random
+
+          class ScrollGuardService : AccessibilityService() {
+              companion object {
+                  @Volatile var pending = 0      // push-ups still owed (0 = not locked)
+                  @Volatile var showing = false  // lock screen currently visible
+                  const val MIN_MINUTES = 5L     // <-- lock interval range, edit here
+                  const val MAX_MINUTES = 15L
+              }
+
+              private var scrolled = 0
+              private var lastScroll = 0L
+              private var lastSeen = 0L
+              private var deadline = 0L
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val now = SystemClock.elapsedRealtime()
+                  if (pending > 0) { lock(); return }  // still owe push-ups: block again
+
+                  // New session if we haven't seen a social app for 2 min
+                  if (deadline == 0L || now - lastSeen > 120_000) {
+                      deadline = now + Random.nextLong(MIN_MINUTES, MAX_MINUTES + 1) * 60_000
+                      scrolled = 0
+                  }
+                  lastSeen = now
+
+                  // Each swipe (debounced) ~= one video
+                  if (e.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED && now - lastScroll > 800) {
+                      scrolled++; lastScroll = now
+                  }
+                  if (now >= deadline) {
+                      pending = maxOf(scrolled, 1)
+                      deadline = 0; scrolled = 0
+                      lock()
+                  }
+              }
+
+              private fun lock() {
+                  if (showing) return
+                  showing = true
+                  startActivity(Intent(this, PushupActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              }
+
+              override fun onInterrupt() {}
+          }
+          EOF_SG
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_SG'
+          <resources>
+              <string name="app_name">ScrollGuard</string>
+              <string name="service_desc">Counts videos you scroll in social apps and locks them until you do push-ups.</string>
+          </resources>
+          EOF_SG
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_SG'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/service_desc"
+              android:accessibilityEventTypes="typeViewScrolled|typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="100"
+              android:canRetrieveWindowContent="false"
+              android:packageNames="com.google.android.youtube,com.instagram.android,com.facebook.katana,com.zhiliaoapp.musically,com.snapchat.android,com.twitter.android,com.reddit.frontpage" />
+          EOF_SG
+          cat > build.gradle.kts <<'EOF_SG'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_SG
+          cat > gradle.properties <<'EOF_SG'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_SG
+          cat > settings.gradle.kts <<'EOF_SG'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ScrollGuard"
+          include(":app")
+          EOF_SG
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScrollGuard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk     import android.os.SystemClock
           import android.view.accessibility.AccessibilityEvent
           import kotlin.random.Random
 
